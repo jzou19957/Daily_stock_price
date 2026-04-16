@@ -1,0 +1,160 @@
+name: Daily Finviz Scrape → Google Drive
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULE  (all times Eastern — UTC is ET+4 in summer, ET+5 in winter;
+#            cron uses UTC so these are approximate to within the hour)
+#
+#   First attempt : 21:05 UTC ≈ 5:05 PM ET   Mon–Fri
+#   Retry 1       : 22:05 UTC ≈ 6:05 PM ET   (+1 hour)
+#   Retry 2       : 23:05 UTC ≈ 7:05 PM ET   (+1 hour)
+#   Retry 3       : 00:05 UTC ≈ 8:05 PM ET   (+1 hour)  ← next UTC day
+#   Retry 4       : 01:05 UTC ≈ 9:05 PM ET   (+1 hour)  ← next UTC day
+#
+#   Every slot checks Drive first — if today's CSV is already there it
+#   exits cleanly without re-scraping.  Only a real failure (exit 1)
+#   causes the next slot to do actual work.
+#
+#   If the 9:05 PM slot still fails, a GitHub Issue is opened so you
+#   get an email alert.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # ── Primary + retries (Mon–Fri) ───────────────────────────────────────
+    - cron: "5 21 * * 1-5"    # ~5:05 PM ET  — first attempt
+    - cron: "5 22 * * 1-5"    # ~6:05 PM ET  — retry 1
+    - cron: "5 23 * * 1-5"    # ~7:05 PM ET  — retry 2
+    - cron: "5 0  * * 2-6"    # ~8:05 PM ET  — retry 3  (fires Tue–Sat UTC)
+    - cron: "5 1  * * 2-6"    # ~9:05 PM ET  — retry 4  (fires Tue–Sat UTC)
+
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: "Pages per view (blank = full run; '3' = quick test)"
+        required: false
+        default: ""
+      force:
+        description: "Force re-run even if today's file already exists on Drive"
+        type: boolean
+        default: false
+
+jobs:
+  scrape-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # full ~10k-ticker scrape takes ~45–60 min
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ─────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Dependencies ───────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install \
+            requests \
+            beautifulsoup4 \
+            lxml \
+            google-api-python-client \
+            google-auth
+
+      # ── 4. Check if today's CSV is already on Drive ───────────────────────
+      # Exit 2 = already done → skip everything below cleanly.
+      # Exit 0 = not found yet → proceed to scrape.
+      # Exit 1 = error checking → also proceed (scrape will surface the error).
+      - name: Check Drive for today's file
+        id: check
+        env:
+          GDRIVE_FOLDER_ID:   ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+        run: |
+          python run_daily.py --check-only
+        continue-on-error: true
+
+      - name: Skip — already done today
+        if: steps.check.outcome == 'success'
+        run: |
+          echo "✓ Today's finviz_MASTER CSV already exists on Google Drive."
+          echo "  Nothing to do — exiting cleanly."
+
+      # ── 5. Scrape + Upload (only if check did NOT find the file) ──────────
+      - name: Scrape Finviz and upload to Google Drive
+        if: steps.check.outcome != 'success'
+        env:
+          GDRIVE_FOLDER_ID:   ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.pages }}" ]; then
+            ARGS="$ARGS --pages ${{ github.event.inputs.pages }}"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          python run_daily.py $ARGS
+
+      # ── 6. Save logs as artifact (always, even on failure) ────────────────
+      - name: Upload scraper log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "log-${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          path: |
+            *.log
+            .progress/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # ── 7. Open a GitHub Issue if the FINAL retry slot fails ──────────────
+      # Only the 9:05 PM slot (cron "5 1 * * 2-6") triggers this.
+      # That means all 5 attempts failed — you'll get an email via the issue.
+      - name: Open failure alert issue
+        if: failure() && github.event.schedule == '5 1 * * 2-6'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().slice(0, 10);
+            const title = `🚨 Finviz scrape FAILED — ${today}`;
+            const body = [
+              `## All retry attempts failed on ${today}`,
+              ``,
+              `Five attempts were made (5 PM → 9 PM ET), all failed.`,
+              ``,
+              `**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              ``,
+              `### Common causes`,
+              `- Finviz returned HTTP 403 (blocked) — try increasing \`--delay\``,
+              `- Google Drive credentials expired or revoked`,
+              `- Job hit the 90-minute timeout (scrape was too slow)`,
+              ``,
+              `### Fix & re-run`,
+              `1. Check the log artifact attached to the run above`,
+              `2. Fix the issue`,
+              `3. Go to **Actions → Daily Finviz Scrape → Run workflow** to trigger manually`,
+              ``,
+              `_Auto-opened by GitHub Actions_`,
+            ].join('\n');
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'scrape-failure',
+            });
+            const exists = issues.data.some(i => i.title === title);
+            if (!exists) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['scrape-failure'],
+              });
+            }

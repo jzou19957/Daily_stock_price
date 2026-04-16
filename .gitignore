@@ -1,0 +1,11 @@
+# Never commit these
+credentials.json
+
+# Scraper working files
+*.log
+.progress/
+
+# Python
+__pycache__/
+*.pyc
+.env
