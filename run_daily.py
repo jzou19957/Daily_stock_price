@@ -2,20 +2,24 @@
 run_daily.py  —  Scrape Finviz + Upload to Google Drive
 ========================================================
 
-Exit codes (used by the GitHub Actions retry loop):
-    0  = success  (CSV scraped and uploaded)
-    2  = already done today  (Drive already has today's file — skip cleanly)
-    1  = failure  (scrape or upload error — next hourly slot will retry)
+How it works:
+  1. Connects to Google Drive
+  2. Checks if today's finviz_MASTER_YYYYMMDD.csv already exists
+     → YES: logs "already done", exits 0  (GitHub Actions sees success)
+     → NO:  scrapes all 6 Finviz views, uploads the CSV, exits 0
+  3. Any error during scrape or upload → exits 1
+     (GitHub Actions sees failure, next hourly slot retries)
 
-Usage:
-    python run_daily.py                          # full run
-    python run_daily.py --pages 3               # local test (~60 tickers/view)
-    python run_daily.py --resume                # continue interrupted scrape
-    python run_daily.py --check-only            # just check if today's file exists on Drive
+Run locally:
+    python run_daily.py                     # full run
+    python run_daily.py --pages 3           # quick test, ~60 tickers/view
+    python run_daily.py --resume            # continue interrupted scrape
+    python run_daily.py --force             # re-run even if today's file exists
 
-Environment variables (set as GitHub Actions secrets):
-    GDRIVE_FOLDER_ID    — Google Drive folder ID
-    GDRIVE_CREDENTIALS  — Full JSON text of your service account key file
+Credentials:
+    Locally    → place credentials.json next to this script
+    GitHub     → set GDRIVE_CREDENTIALS secret (full JSON text)
+    Folder ID  → set GDRIVE_FOLDER_ID secret (or use --folder-id flag)
 """
 
 import argparse
@@ -35,48 +39,26 @@ logging.basicConfig(
 log = logging.getLogger("runner")
 
 # ── NYSE Holiday Calendar ─────────────────────────────────────────────────────
-# Source: NYSE Holidays & Trading Hours (verified from screenshot)
 
 NYSE_HOLIDAYS = {
     # 2026
-    date(2026, 1,  1),   # New Year's Day
-    date(2026, 1,  19),  # Martin Luther King Jr. Day
-    date(2026, 2,  16),  # Washington's Birthday
-    date(2026, 4,  3),   # Good Friday
-    date(2026, 5,  25),  # Memorial Day
-    date(2026, 6,  19),  # Juneteenth
-    date(2026, 7,  3),   # Independence Day (observed, July 4 is Saturday)
-    date(2026, 9,  7),   # Labor Day
-    date(2026, 11, 26),  # Thanksgiving Day
-    date(2026, 12, 25),  # Christmas Day
-
+    date(2026, 1,  1),  date(2026, 1,  19), date(2026, 2,  16),
+    date(2026, 4,  3),  date(2026, 5,  25), date(2026, 6,  19),
+    date(2026, 7,  3),  date(2026, 9,  7),  date(2026, 11, 26),
+    date(2026, 12, 25),
     # 2027
-    date(2027, 1,  1),   # New Year's Day
-    date(2027, 1,  18),  # Martin Luther King Jr. Day
-    date(2027, 2,  15),  # Washington's Birthday
-    date(2027, 3,  26),  # Good Friday
-    date(2027, 5,  31),  # Memorial Day
-    date(2027, 6,  18),  # Juneteenth (observed, June 19 is Saturday)
-    date(2027, 7,  5),   # Independence Day (observed, July 4 is Sunday)
-    date(2027, 9,  6),   # Labor Day
-    date(2027, 11, 25),  # Thanksgiving Day
-    date(2027, 12, 24),  # Christmas Day (observed, Dec 25 is Saturday)
-
+    date(2027, 1,  1),  date(2027, 1,  18), date(2027, 2,  15),
+    date(2027, 3,  26), date(2027, 5,  31), date(2027, 6,  18),
+    date(2027, 7,  5),  date(2027, 9,  6),  date(2027, 11, 25),
+    date(2027, 12, 24),
     # 2028
-    date(2028, 1,  17),  # Martin Luther King Jr. Day  (Jan 1 not observed — falls on weekend)
-    date(2028, 2,  21),  # Washington's Birthday
-    date(2028, 4,  14),  # Good Friday
-    date(2028, 5,  29),  # Memorial Day
-    date(2028, 6,  19),  # Juneteenth
-    date(2028, 7,  4),   # Independence Day
-    date(2028, 9,  4),   # Labor Day
-    date(2028, 11, 23),  # Thanksgiving Day
-    date(2028, 12, 25),  # Christmas Day
+    date(2028, 1,  17), date(2028, 2,  21), date(2028, 4,  14),
+    date(2028, 5,  29), date(2028, 6,  19), date(2028, 7,  4),
+    date(2028, 9,  4),  date(2028, 11, 23), date(2028, 12, 25),
 }
 
 
 def last_trading_day(ref: date = None) -> date:
-    """Most recent NYSE trading day on or before ref (default: today)."""
     d = ref or date.today()
     while d.weekday() >= 5 or d in NYSE_HOLIDAYS:
         d -= timedelta(days=1)
@@ -88,13 +70,13 @@ def is_trading_day(d: date = None) -> bool:
     return d.weekday() < 5 and d not in NYSE_HOLIDAYS
 
 
-# ── Credentials helper ────────────────────────────────────────────────────────
+# ── Credentials ───────────────────────────────────────────────────────────────
 
 def resolve_credentials() -> str:
     """
-    Returns path to credentials.json.
-    In GitHub Actions the GDRIVE_CREDENTIALS secret holds the full JSON string.
-    Locally the file should already exist next to the scripts.
+    Find credentials.json.
+    GitHub Actions: reads from GDRIVE_CREDENTIALS secret (full JSON string).
+    Local:          looks for credentials.json next to this script.
     """
     creds_json = os.environ.get("GDRIVE_CREDENTIALS", "")
     if creds_json:
@@ -105,11 +87,13 @@ def resolve_credentials() -> str:
     if Path("credentials.json").exists():
         log.info("Using local credentials.json")
         return "credentials.json"
-    log.error("No credentials! Set GDRIVE_CREDENTIALS env var or place credentials.json here.")
+    log.error("No credentials found.")
+    log.error("  Local:  place credentials.json next to this script")
+    log.error("  GitHub: set the GDRIVE_CREDENTIALS secret")
     sys.exit(1)
 
 
-# ── Google Drive helpers ──────────────────────────────────────────────────────
+# ── Google Drive ──────────────────────────────────────────────────────────────
 
 def build_drive_service(creds_path: str):
     from google.oauth2 import service_account
@@ -141,20 +125,6 @@ def upload_to_drive(service, local_path: Path, folder_id: str) -> str:
     return f["id"]
 
 
-# ── Already-done check ────────────────────────────────────────────────────────
-
-def check_already_done(service, folder_id: str) -> bool:
-    """Return True if today's trading-day CSV already exists on Drive."""
-    today         = last_trading_day()
-    expected_name = f"finviz_MASTER_{today.strftime('%Y%m%d')}.csv"
-    existing      = file_exists_on_drive(service, expected_name, folder_id)
-    if existing:
-        log.info(f"  ✓ Already on Drive: {expected_name}  (id={existing})")
-        return True
-    log.info(f"  Not yet on Drive: {expected_name}")
-    return False
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(args):
@@ -162,28 +132,38 @@ def run(args):
     log.info("  Finviz Daily Runner")
     log.info("=" * 62)
 
+    # ── Resolve folder ID ─────────────────────────────────────────────────────
     folder_id = args.folder_id or os.environ.get("GDRIVE_FOLDER_ID", "")
     if not folder_id:
-        log.error("No folder ID — set --folder-id or GDRIVE_FOLDER_ID env var.")
+        log.error("No Google Drive folder ID.")
+        log.error("  Local:  python run_daily.py --folder-id YOUR_FOLDER_ID")
+        log.error("  GitHub: set the GDRIVE_FOLDER_ID secret")
         sys.exit(1)
 
+    # ── Skip on non-trading days (unless forced) ──────────────────────────────
     if not is_trading_day() and not args.force:
-        log.info("Today is not a trading day (weekend or NYSE holiday). Nothing to do.")
+        log.info("Today is not a trading day — nothing to do.")
         log.info("Use --force to run anyway.")
         sys.exit(0)
 
+    # ── Connect to Drive ──────────────────────────────────────────────────────
     creds_path = resolve_credentials()
     log.info("Connecting to Google Drive…")
-    service = build_drive_service(creds_path)
+    try:
+        service = build_drive_service(creds_path)
+    except Exception as e:
+        log.error(f"Could not connect to Google Drive: {e}")
+        sys.exit(1)
 
-    # ── Already done? ─────────────────────────────────────────────────────────
-    if check_already_done(service, folder_id):
-        log.info("Today's file is already on Drive — nothing to do.")
-        sys.exit(2)   # clean skip, not a failure
+    # ── Check if today's file already exists ──────────────────────────────────
+    today         = last_trading_day()
+    expected_name = f"finviz_MASTER_{today.strftime('%Y%m%d')}.csv"
+    existing_id   = file_exists_on_drive(service, expected_name, folder_id)
 
-    if args.check_only:
-        log.info("--check-only: file not found, would proceed with scrape.")
-        sys.exit(0)
+    if existing_id and not args.force:
+        log.info(f"  ✓ Already on Drive: {expected_name}")
+        log.info("  Nothing to do — exiting cleanly.")
+        sys.exit(0)   # success — not an error, just already done
 
     # ── Step 1: Scrape ────────────────────────────────────────────────────────
     log.info("\n[1/2]  Scraping Finviz…\n")
@@ -206,7 +186,7 @@ def run(args):
         log.error("Scraper returned no output file.")
         sys.exit(1)
 
-    log.info(f"Scrape complete → {csv_path}  ({Path(csv_path).stat().st_size/1024:.0f} KB)")
+    log.info(f"Scrape complete → {csv_path}  ({Path(csv_path).stat().st_size / 1024:.0f} KB)")
 
     # ── Step 2: Upload ────────────────────────────────────────────────────────
     log.info("\n[2/2]  Uploading to Google Drive…\n")
@@ -229,25 +209,20 @@ if __name__ == "__main__":
         description="Scrape Finviz + Upload to Google Drive",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Exit codes:  0=success  2=already done today  1=failure (retry next hour)
-
-Local test (quick):
-  python run_daily.py --pages 3 --folder-id 1AQFN2b6iReA2jCr31pqWXlnTpvfffdqx
-
-Full run:
+Examples:
+  python run_daily.py                                      # full run
+  python run_daily.py --pages 3                           # quick test
+  python run_daily.py --resume                            # continue interrupted
+  python run_daily.py --force                             # re-run even if done today
   python run_daily.py --folder-id 1AQFN2b6iReA2jCr31pqWXlnTpvfffdqx
-
-Check if today's file already on Drive:
-  python run_daily.py --check-only --folder-id 1AQFN2b6iReA2jCr31pqWXlnTpvfffdqx
         """,
     )
-    parser.add_argument("--pages",      type=int,   default=None)
-    parser.add_argument("--filters",    type=str,   default="")
-    parser.add_argument("--resume",     action="store_true")
-    parser.add_argument("--delay",      type=float, default=2.5)
-    parser.add_argument("--jitter",     type=float, default=1.5)
-    parser.add_argument("--folder-id",  type=str,   default="",  dest="folder_id")
-    parser.add_argument("--out-dir",    type=str,   default=".", dest="out_dir")
-    parser.add_argument("--force",      action="store_true",     help="Run even on non-trading days")
-    parser.add_argument("--check-only", action="store_true",     dest="check_only")
+    parser.add_argument("--pages",     type=int,   default=None,  help="Pages per view (None=all, 3=quick test)")
+    parser.add_argument("--filters",   type=str,   default="",    help="Finviz filter params")
+    parser.add_argument("--resume",    action="store_true",       help="Resume interrupted scrape")
+    parser.add_argument("--delay",     type=float, default=2.5,   help="Base delay between requests (s)")
+    parser.add_argument("--jitter",    type=float, default=1.5,   help="Max random extra delay (s)")
+    parser.add_argument("--folder-id", type=str,   default="",    dest="folder_id", help="Google Drive folder ID")
+    parser.add_argument("--out-dir",   type=str,   default=".",   dest="out_dir",   help="Local output folder")
+    parser.add_argument("--force",     action="store_true",       help="Run even if today's file already on Drive")
     run(parser.parse_args())
